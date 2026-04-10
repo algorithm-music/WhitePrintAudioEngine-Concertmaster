@@ -1,12 +1,13 @@
 """
 Client for audition service (internal).
-POST /internal/analyze — multipart audio → analysis_json
+POST /internal/analyze-url — JSON {audio_url} → analysis_json
 """
 
 import os
 import logging
-import httpx
+
 from concertmaster.clients.auth import get_auth_header
+from concertmaster.clients.http_pool import get_client
 
 logger = logging.getLogger("concertmaster.client.audition")
 
@@ -34,11 +35,12 @@ async def analyze(audio_url: str) -> dict:
     headers = get_auth_header(AUDITION_URL)
     headers["Content-Type"] = "application/json"
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.post(
-            url,
-            json={"audio_url": audio_url},
-            headers=headers,
-        )
-        resp.raise_for_status()
-        return resp.json()
+    client = get_client()
+    resp = await client.post(
+        url,
+        json={"audio_url": audio_url},
+        headers=headers,
+        timeout=TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()

@@ -15,14 +15,18 @@ import json
 import logging
 import os
 import sys
+import uuid
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Security
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Depends, Security
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from concertmaster.clients.http_pool import init_pool, close_pool
 from concertmaster.services import job_conductor
 
 # ──────────────────────────────────────────
@@ -36,6 +40,16 @@ logging.basicConfig(
 logger = logging.getLogger("concertmaster")
 
 # ──────────────────────────────────────────
+# Lifespan (shared HTTP pool)
+# ──────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_pool()
+    yield
+    await close_pool()
+
+
+# ──────────────────────────────────────────
 # App
 # ──────────────────────────────────────────
 app = FastAPI(
@@ -43,6 +57,7 @@ app = FastAPI(
     description="AI-powered dynamic mastering. Paste a link. Get mastered audio.",
     version="1.0.0",
     docs_url="/docs",
+    lifespan=lifespan,
 )
 
 # CORS
@@ -54,8 +69,20 @@ if _cors_origins:
         allow_origins=_cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "X-Request-Id"],
     )
+
+
+# ──────────────────────────────────────────
+# Request ID Middleware
+# ──────────────────────────────────────────
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request_id
+    return response
 
 
 # ──────────────────────────────────────────
@@ -240,9 +267,18 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
         raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)[:200]}")
+    except httpx.TimeoutException:
+        logger.error("Pipeline timeout", exc_info=True)
+        raise HTTPException(status_code=504, detail="Pipeline timed out. Please try again.")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Downstream service error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Downstream service returned {e.response.status_code}",
+        )
+    except Exception:
+        logger.error("Pipeline failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal pipeline error")
 
 
 # ──────────────────────────────────────────

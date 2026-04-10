@@ -12,6 +12,7 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 USER appuser
 
 ENV PORT=8080
+ENV WORKERS=1
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
@@ -20,5 +21,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 CMD exec uvicorn concertmaster.main:app \
     --host 0.0.0.0 \
     --port $PORT \
-    --workers 1 \
+    --workers $WORKERS \
     --timeout-keep-alive 300

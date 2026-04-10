@@ -6,8 +6,9 @@ POST /internal/master-url — JSON (audio_url + params) → mastered WAV
 import json
 import os
 import logging
-import httpx
+
 from concertmaster.clients.auth import get_auth_header
+from concertmaster.clients.http_pool import get_client
 
 logger = logging.getLogger("concertmaster.client.rendition_dsp")
 
@@ -41,34 +42,35 @@ async def master(
     headers = get_auth_header(RENDITION_DSP_URL)
     headers["Content-Type"] = "application/json"
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        req_body = {
-            "audio_url": audio_url,
-            "params": params,
-            "target_lufs": target_lufs,
-            "target_true_peak": target_true_peak,
-        }
-        if output_url is not None:
-            req_body["output_url"] = output_url
+    req_body = {
+        "audio_url": audio_url,
+        "params": params,
+        "target_lufs": target_lufs,
+        "target_true_peak": target_true_peak,
+    }
+    if output_url is not None:
+        req_body["output_url"] = output_url
 
-        resp = await client.post(
-            url,
-            json=req_body,
-            headers=headers,
-        )
-        resp.raise_for_status()
+    client = get_client()
+    resp = await client.post(
+        url,
+        json=req_body,
+        headers=headers,
+        timeout=TIMEOUT,
+    )
+    resp.raise_for_status()
 
-        if resp.headers.get("content-type", "").startswith("application/json"):
-            # Output was uploaded directly to output_url
-            data = resp.json()
-            return None, data.get("metrics", {})
-        else:
-            # Parse metrics from X-Metrics header
-            metrics_raw = resp.headers.get("X-Metrics", "{}")
-            try:
-                metrics = json.loads(metrics_raw)
-            except json.JSONDecodeError:
-                metrics = {"error": "failed to parse X-Metrics header"}
-                logger.warning(f"Failed to parse X-Metrics: {metrics_raw[:200]}")
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        # Output was uploaded directly to output_url
+        data = resp.json()
+        return None, data.get("metrics", {})
+    else:
+        # Parse metrics from X-Metrics header
+        metrics_raw = resp.headers.get("X-Metrics", "{}")
+        try:
+            metrics = json.loads(metrics_raw)
+        except json.JSONDecodeError:
+            metrics = {"error": "failed to parse X-Metrics header"}
+            logger.warning(f"Failed to parse X-Metrics: {metrics_raw[:200]}")
 
-            return resp.content, metrics
+        return resp.content, metrics

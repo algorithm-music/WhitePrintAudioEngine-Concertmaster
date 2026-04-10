@@ -13,7 +13,9 @@ Routes:
 Stores nothing. Returns everything. Forgets immediately.
 """
 
+import ipaddress
 import re
+import socket
 import time
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -21,11 +23,70 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import httpx
 
 from concertmaster.clients import audition_client, deliberation_client, rendition_dsp_client
+from concertmaster.clients.http_pool import get_client
 
 logger = logging.getLogger("concertmaster.conductor")
 
 FETCH_TIMEOUT = 60.0  # 60s to download audio from external URL
 MAX_AUDIO_SIZE = 200 * 1024 * 1024  # 200MB hard limit
+
+# ══════════════════════════════════════════
+# SSRF Protection
+# ══════════════════════════════════════════
+_BLOCKED_HOSTNAMES = {
+    "metadata.google.internal",
+    "metadata",
+}
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is private, loopback, or link-local."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+        )
+    except ValueError:
+        return False
+
+
+def validate_url_safe(url: str) -> None:
+    """Reject URLs targeting internal/private networks (SSRF protection).
+
+    Raises:
+        ValueError: if the URL targets a blocked or private address.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+    hostname = parsed.hostname or ""
+
+    # Block known metadata endpoints
+    if hostname.lower() in _BLOCKED_HOSTNAMES:
+        raise ValueError("Blocked: metadata service access is not allowed")
+
+    # Block GCP metadata IP
+    if hostname in ("169.254.169.254",):
+        raise ValueError("Blocked: metadata service access is not allowed")
+
+    # Resolve hostname and check all IPs
+    try:
+        addrinfos = socket.getaddrinfo(hostname, parsed.port or 443)
+    except socket.gaierror:
+        raise ValueError(f"Cannot resolve hostname: {hostname}")
+
+    for _family, _type, _proto, _canonname, sockaddr in addrinfos:
+        ip_str = sockaddr[0]
+        if _is_private_ip(ip_str):
+            raise ValueError(
+                f"Blocked: URL resolves to private/internal address"
+            )
 
 
 # ══════════════════════════════════════════
@@ -73,39 +134,33 @@ async def fetch_audio(url: str) -> bytes:
     """Fetch audio from external URL into memory.
 
     Raises:
-        ValueError: URL validation failure
+        ValueError: URL validation failure or SSRF attempt
         httpx.HTTPStatusError: non-2xx from source
         httpx.TimeoutException: download timeout
     """
     normalized = normalize_audio_url(url)
+    validate_url_safe(normalized)
+
     parsed = urlparse(normalized)
-
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
-
     logger.info(f"Fetching audio: {parsed.netloc}{parsed.path[:60]}...")
 
-    async with httpx.AsyncClient(
-        timeout=FETCH_TIMEOUT,
-        follow_redirects=True,
-        max_redirects=5,
-    ) as client:
-        resp = await client.get(normalized)
-        resp.raise_for_status()
+    client = get_client()
+    resp = await client.get(normalized, timeout=FETCH_TIMEOUT)
+    resp.raise_for_status()
 
-        audio_bytes = resp.content
+    audio_bytes = resp.content
 
-        if len(audio_bytes) > MAX_AUDIO_SIZE:
-            raise ValueError(
-                f"Audio file too large: {len(audio_bytes) / 1024 / 1024:.1f}MB "
-                f"(max {MAX_AUDIO_SIZE / 1024 / 1024:.0f}MB)"
-            )
+    if len(audio_bytes) > MAX_AUDIO_SIZE:
+        raise ValueError(
+            f"Audio file too large: {len(audio_bytes) / 1024 / 1024:.1f}MB "
+            f"(max {MAX_AUDIO_SIZE / 1024 / 1024:.0f}MB)"
+        )
 
-        if len(audio_bytes) < 44:
-            raise ValueError("Downloaded file too small to be valid audio")
+    if len(audio_bytes) < 44:
+        raise ValueError("Downloaded file too small to be valid audio")
 
-        logger.info(f"Fetched {len(audio_bytes) / 1024 / 1024:.1f}MB")
-        return audio_bytes
+    logger.info(f"Fetched {len(audio_bytes) / 1024 / 1024:.1f}MB")
+    return audio_bytes
 
 
 # ══════════════════════════════════════════
@@ -122,8 +177,9 @@ async def run_full(
     """Full route: analyze(url) → deliberation → fetch → rendition_dsp → return."""
     t0 = time.time()
 
-    # 1. Normalize URL for direct download
+    # 1. Normalize URL for direct download + SSRF check
     normalized_url = normalize_audio_url(audio_url)
+    validate_url_safe(normalized_url)
 
     # 2. Analyze (audition fetches audio itself — no 32MB limit)
     analysis = await audition_client.analyze(normalized_url)
@@ -169,6 +225,7 @@ async def run_analyze_only(audio_url: str) -> dict:
     """Analyze-only route: analyze(url) → return."""
     t0 = time.time()
     normalized_url = normalize_audio_url(audio_url)
+    validate_url_safe(normalized_url)
     analysis = await audition_client.analyze(normalized_url)
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -188,6 +245,7 @@ async def run_deliberation_only(
     """Deliberation-only route: analyze(url) → deliberation → return."""
     t0 = time.time()
     normalized_url = normalize_audio_url(audio_url)
+    validate_url_safe(normalized_url)
     analysis = await audition_client.analyze(normalized_url)
     deliberation_result = await deliberation_client.deliberate(
         analysis=analysis,
@@ -215,6 +273,7 @@ async def run_dsp_only(
     """RENDITION_DSP-only route: rendition_dsp (manual params, fetches audio itself) → return."""
     t0 = time.time()
     normalized_url = normalize_audio_url(audio_url)
+    validate_url_safe(normalized_url)
     mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
         audio_url=normalized_url,
         params=manual_params,

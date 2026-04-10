@@ -5,8 +5,9 @@ POST /internal/deliberate — analysis_data → opinions + adopted_params
 
 import os
 import logging
-import httpx
+
 from concertmaster.clients.auth import get_auth_header
+from concertmaster.clients.http_pool import get_client
 
 logger = logging.getLogger("concertmaster.client.deliberation")
 
@@ -54,8 +55,7 @@ async def deliberate(
     if sage_config:
         payload["sage_config"] = sage_config
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-
+    client = get_client()
+    resp = await client.post(url, json=payload, headers=headers, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
