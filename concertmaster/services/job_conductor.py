@@ -24,6 +24,7 @@ import httpx
 
 from concertmaster.clients import audition_client, deliberation_client, rendition_dsp_client
 from concertmaster.clients.http_pool import get_client
+from concertmaster.services.url_resolver import resolve_audio_url, is_known_provider
 
 logger = logging.getLogger("concertmaster.conductor")
 
@@ -177,8 +178,11 @@ async def run_full(
     """Full route: analyze(url) → deliberation → fetch → rendition_dsp → return."""
     t0 = time.time()
 
+    # 0. Resolve unknown URLs (Suno, SoundCloud, etc.) via Gemini
+    resolved_url = await resolve_audio_url(audio_url)
+
     # 1. Normalize URL for direct download + SSRF check
-    normalized_url = normalize_audio_url(audio_url)
+    normalized_url = normalize_audio_url(resolved_url)
     validate_url_safe(normalized_url)
 
     # 2. Analyze (audition fetches audio itself — no 32MB limit)
@@ -224,7 +228,8 @@ async def run_full(
 async def run_analyze_only(audio_url: str) -> dict:
     """Analyze-only route: analyze(url) → return."""
     t0 = time.time()
-    normalized_url = normalize_audio_url(audio_url)
+    resolved_url = await resolve_audio_url(audio_url)
+    normalized_url = normalize_audio_url(resolved_url)
     validate_url_safe(normalized_url)
     analysis = await audition_client.analyze(normalized_url)
     elapsed_ms = int((time.time() - t0) * 1000)
@@ -244,7 +249,8 @@ async def run_deliberation_only(
 ) -> dict:
     """Deliberation-only route: analyze(url) → deliberation → return."""
     t0 = time.time()
-    normalized_url = normalize_audio_url(audio_url)
+    resolved_url = await resolve_audio_url(audio_url)
+    normalized_url = normalize_audio_url(resolved_url)
     validate_url_safe(normalized_url)
     analysis = await audition_client.analyze(normalized_url)
     deliberation_result = await deliberation_client.deliberate(
@@ -272,7 +278,8 @@ async def run_dsp_only(
 ) -> dict:
     """RENDITION_DSP-only route: rendition_dsp (manual params, fetches audio itself) → return."""
     t0 = time.time()
-    normalized_url = normalize_audio_url(audio_url)
+    resolved_url = await resolve_audio_url(audio_url)
+    normalized_url = normalize_audio_url(resolved_url)
     validate_url_safe(normalized_url)
     mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
         audio_url=normalized_url,

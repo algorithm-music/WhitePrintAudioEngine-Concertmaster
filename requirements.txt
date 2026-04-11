@@ -7,3 +7,6 @@ httpx>=0.28.0,<1.0
 # Service-to-service OIDC auth (Cloud Run)
 google-auth>=2.0,<3.0
 requests>=2.28,<3.0
+
+# Gemini — URL resolution for non-standard audio sources
+google-genai>=1.14,<2.0
