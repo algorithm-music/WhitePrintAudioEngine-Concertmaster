@@ -56,7 +56,19 @@ async def resolve_audio_url(url: str) -> dict:
         {"type": "url", "value": "https://..."} or
         {"type": "file", "value": "/tmp/.../audio.wav"}
     """
-    if is_known_provider(url) or _looks_like_direct_audio(url):
+    if _looks_like_direct_audio(url):
+        return {"type": "url", "value": url}
+
+    # Google Drive: extract file ID → direct download → FFmpeg → WAV
+    if "drive.google.com" in url or "docs.google.com" in url:
+        try:
+            local_wav = await _download_gdrive(url)
+            if local_wav:
+                return {"type": "file", "value": local_wav}
+        except Exception as e:
+            logger.warning(f"GDrive download failed: {e}")
+
+    if is_known_provider(url):
         return {"type": "url", "value": url}
 
     logger.info(f"Unknown audio source, resolving: {url}")
@@ -99,6 +111,74 @@ async def resolve_audio_url(url: str) -> dict:
         "Tried: Suno CDN, yt-dlp, Gemini. "
         "Please provide a direct audio URL or Google Drive/Dropbox link."
     )
+
+
+async def _download_gdrive(url: str) -> str | None:
+    """Download from Google Drive with virus scan bypass + FFmpeg WAV conversion."""
+    # Extract file ID
+    match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
+    if not match:
+        match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
+    if not match:
+        logger.warning("Cannot extract file ID from GDrive URL")
+        return None
+
+    file_id = match.group(1)
+    dl_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    logger.info(f"GDrive direct download: file_id={file_id}")
+
+    fd_raw, temp_raw = tempfile.mkstemp(suffix=".tmp")
+    os.close(fd_raw)
+    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd_wav)
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+            resp = await client.get(dl_url)
+
+            # Bypass virus scan warning (large files)
+            confirm_token = None
+            for key, value in resp.cookies.items():
+                if key.startswith("download_warning"):
+                    confirm_token = value
+                    break
+
+            if confirm_token:
+                logger.info("Bypassing GDrive virus scan...")
+                resp = await client.get(f"{dl_url}&confirm={confirm_token}")
+
+            resp.raise_for_status()
+
+            with open(temp_raw, "wb") as f:
+                f.write(resp.content)
+
+        sz = os.path.getsize(temp_raw)
+        if sz < 50000:
+            raise ValueError(f"GDrive file too small ({sz}B) — likely HTML error page")
+
+        logger.info(f"GDrive downloaded {sz / 1024:.0f}KB, converting to WAV...")
+
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-i", temp_raw,
+             "-vn", "-acodec", "pcm_s24le", "-ar", "48000",
+             temp_wav],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        wav_sz = os.path.getsize(temp_wav)
+        logger.info(f"GDrive WAV: {wav_sz / 1024 / 1024:.1f}MB")
+        return temp_wav
+
+    except Exception as e:
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
+        raise RuntimeError(f"GDrive failed: {e}")
+    finally:
+        if os.path.exists(temp_raw):
+            os.remove(temp_raw)
 
 
 async def _resolve_suno(url: str) -> str | None:
