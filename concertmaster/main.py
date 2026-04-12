@@ -69,7 +69,7 @@ if _cors_origins:
         allow_origins=_cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Request-Id"],
+        allow_headers=["Content-Type", "Authorization", "X-Request-Id", "X-Api-Key"],
     )
 
 

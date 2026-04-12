@@ -6,9 +6,11 @@ For unknown URLs (Suno, SoundCloud, BandCamp, etc.), fetches the page HTML and a
 to find the direct audio stream URL.
 """
 
+import asyncio
 import os
 import re
 import logging
+import tempfile
 from urllib.parse import urlparse
 
 import httpx
@@ -76,9 +78,15 @@ async def resolve_audio_url(url: str) -> str:
     if is_known_provider(url) or _looks_like_direct_audio(url):
         return url
 
-    logger.info(f"Unknown audio source, resolving with Gemini: {url}")
+    logger.info(f"Unknown audio source, resolving: {url}")
 
-    # Fetch the page HTML
+    # Try yt-dlp first (supports Suno, YouTube, SoundCloud, 1000+ sites)
+    try:
+        return await _resolve_with_ytdlp(url)
+    except Exception as e:
+        logger.info(f"yt-dlp failed ({e}), falling back to Gemini")
+
+    # Fallback: Gemini HTML scraping
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             resp = await client.get(url, headers={
@@ -112,16 +120,61 @@ async def resolve_audio_url(url: str) -> str:
         raise ValueError(f"Gemini URL resolution failed: {e}")
 
     if not result or result == "NO_AUDIO_FOUND":
-        raise ValueError(
-            f"No audio URL found on page: {url}. "
-            "Please provide a direct link to a WAV, FLAC, or AIFF file, "
-            "or use Google Drive / Dropbox / S3."
-        )
+        # Gemini couldn't find it — try yt-dlp as last resort
+        logger.info(f"Gemini failed, trying yt-dlp for: {url}")
+        return await _resolve_with_ytdlp(url)
 
     # Validate the extracted URL
-    extracted = result.split('\n')[0].strip()  # Take first line only
+    extracted = result.split('\n')[0].strip()
     if not extracted.startswith("http"):
-        raise ValueError(f"Gemini returned invalid URL: {extracted}")
+        # Invalid Gemini result — try yt-dlp
+        logger.info(f"Gemini returned invalid URL, trying yt-dlp for: {url}")
+        return await _resolve_with_ytdlp(url)
 
     logger.info(f"Resolved audio URL: {extracted[:80]}...")
     return extracted
+
+
+async def _resolve_with_ytdlp(url: str) -> str:
+    """Use yt-dlp to download audio and return local file path.
+
+    yt-dlp supports Suno, YouTube, SoundCloud, BandCamp, and 1000+ sites.
+    Downloads to a temp WAV file and returns the file:// path.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        raise ValueError(
+            f"Cannot resolve {url}: yt-dlp not installed and Gemini failed. "
+            "Please provide a direct audio URL."
+        )
+
+    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+    out_template = os.path.join(tmp_dir, "audio.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": out_template,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "wav",
+            "preferredquality": "192",
+        }],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+    await asyncio.to_thread(_download)
+
+    # Find the downloaded file
+    for f in os.listdir(tmp_dir):
+        if f.endswith(".wav"):
+            result_path = os.path.join(tmp_dir, f)
+            logger.info(f"yt-dlp resolved: {result_path}")
+            return result_path
+
+    raise ValueError(f"yt-dlp downloaded but no WAV found in {tmp_dir}")

@@ -10,3 +10,6 @@ requests>=2.28,<3.0
 
 # Gemini — URL resolution for non-standard audio sources
 google-genai>=1.14,<2.0
+
+# yt-dlp — Universal audio downloader (Suno, YouTube, SoundCloud, 1000+ sites)
+yt-dlp>=2024.0
