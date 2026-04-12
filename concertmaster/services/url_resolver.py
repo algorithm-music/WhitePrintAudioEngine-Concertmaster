@@ -27,6 +27,9 @@ import httpx
 
 logger = logging.getLogger("concertmaster.url_resolver")
 
+_GCS_TMP = "/mnt/gcs/aimastering-tmp-audio"
+TEMP_DIR = _GCS_TMP if os.path.isdir(_GCS_TMP) else None
+
 _KNOWN_AUDIO_HOSTS = {
     "drive.google.com", "docs.google.com",
     "dropbox.com", "www.dropbox.com", "dl.dropboxusercontent.com",
@@ -127,9 +130,9 @@ async def _download_gdrive(url: str) -> str | None:
     dl_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     logger.info(f"GDrive direct download: file_id={file_id}")
 
-    fd_raw, temp_raw = tempfile.mkstemp(suffix=".tmp")
+    fd_raw, temp_raw = tempfile.mkstemp(suffix=".tmp", dir=TEMP_DIR)
     os.close(fd_raw)
-    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav")
+    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav", dir=TEMP_DIR)
     os.close(fd_wav)
 
     try:
@@ -214,9 +217,9 @@ async def _resolve_suno(url: str) -> str | None:
 
 async def _download_and_convert_to_wav(direct_url: str) -> str:
     """Download audio from CDN and convert to WAV via FFmpeg."""
-    fd_src, temp_src = tempfile.mkstemp(suffix=".mp3")
+    fd_src, temp_src = tempfile.mkstemp(suffix=".mp3", dir=TEMP_DIR)
     os.close(fd_src)
-    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav")
+    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav", dir=TEMP_DIR)
     os.close(fd_wav)
 
     try:
@@ -298,7 +301,7 @@ async def _ytdlp_download(url: str) -> str | None:
     except ImportError:
         return None
 
-    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_", dir=TEMP_DIR)
     out_template = os.path.join(tmp_dir, "audio.%(ext)s")
 
     def _download():

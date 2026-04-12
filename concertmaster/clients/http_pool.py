@@ -59,7 +59,7 @@ async def init_pool() -> None:
         transport=transport,
         follow_redirects=True,
         max_redirects=5,
-        timeout=httpx.Timeout(300.0, connect=10.0),
+        timeout=httpx.Timeout(900.0, connect=10.0),
     )
 
 

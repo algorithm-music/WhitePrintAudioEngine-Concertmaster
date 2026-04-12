@@ -328,21 +328,25 @@ async def run_dsp_only(
     t0 = time.time()
     resolved = await resolve_audio_url(audio_url)
     if resolved["type"] == "file":
-        # TODO: rendition_dsp_client needs file upload support
-        # For now, this path won't work — Suno URLs go through full route
-        normalized_url = resolved["value"]
-        _cleanup_resolved(resolved)
+        mastered_bytes, dsp_metrics = await rendition_dsp_client.master_file(
+            file_path=resolved["value"],
+            params=manual_params,
+            target_lufs=target_lufs,
+            target_true_peak=target_true_peak,
+            output_url=output_url,
+        )
     else:
         normalized_url = normalize_audio_url(resolved["value"])
         validate_url_safe(normalized_url)
-    mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
-        audio_url=normalized_url,
-        params=manual_params,
-        target_lufs=target_lufs,
-        target_true_peak=target_true_peak,
-        output_url=output_url,
-    )
+        mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
+            audio_url=normalized_url,
+            params=manual_params,
+            target_lufs=target_lufs,
+            target_true_peak=target_true_peak,
+            output_url=output_url,
+        )
     elapsed_ms = int((time.time() - t0) * 1000)
+    _cleanup_resolved(resolved)
 
     return {
         "route": "dsp_only",
