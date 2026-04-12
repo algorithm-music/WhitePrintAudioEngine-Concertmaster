@@ -44,3 +44,23 @@ async def analyze(audio_url: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+async def analyze_file(file_path: str) -> dict:
+    """Upload a local audio file to audition for analysis.
+
+    Used when yt-dlp downloaded audio to a local temp file.
+    """
+    url = f"{AUDITION_URL}/internal/analyze"
+    headers = get_auth_header(AUDITION_URL)
+
+    client = get_client()
+    with open(file_path, "rb") as f:
+        resp = await client.post(
+            url,
+            files={"file": ("audio.wav", f, "audio/wav")},
+            headers=headers,
+            timeout=TIMEOUT,
+        )
+    resp.raise_for_status()
+    return resp.json()

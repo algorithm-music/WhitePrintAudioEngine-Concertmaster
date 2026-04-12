@@ -1,54 +1,40 @@
 """
-URL Resolver — Uses Gemini to extract direct audio download URLs from arbitrary web pages.
+URL Resolver — Resolves arbitrary audio URLs to direct download URLs or local files.
 
-For known providers (Google Drive, Dropbox, OneDrive, S3), uses deterministic URL rewriting.
-For unknown URLs (Suno, SoundCloud, BandCamp, etc.), fetches the page HTML and asks Gemini
-to find the direct audio stream URL.
+Resolution chain:
+1. Known providers (Google Drive, Dropbox, OneDrive, S3) → URL rewrite
+2. Direct audio links (.wav/.mp3/.flac) → pass through
+3. Suno special: extract cdn1.suno.ai direct link from og:audio meta tag
+4. yt-dlp extract_info (get direct URL without downloading)
+5. yt-dlp download to local WAV (last resort)
+6. Gemini HTML scraping (final fallback)
+
+Returns either:
+  {"type": "url", "value": "https://cdn1.suno.ai/..."} — direct URL
+  {"type": "file", "value": "/tmp/ytdlp_xxx/audio.wav"} — local file path
 """
 
 import asyncio
+import json
 import os
 import re
 import logging
+import subprocess
 import tempfile
 from urllib.parse import urlparse
 
 import httpx
-from google import genai
 
 logger = logging.getLogger("concertmaster.url_resolver")
 
-# Known providers that don't need Gemini
 _KNOWN_AUDIO_HOSTS = {
-    "drive.google.com",
-    "docs.google.com",
-    "dropbox.com",
-    "www.dropbox.com",
-    "dl.dropboxusercontent.com",
-    "1drv.ms",
-    "onedrive.live.com",
+    "drive.google.com", "docs.google.com",
+    "dropbox.com", "www.dropbox.com", "dl.dropboxusercontent.com",
+    "1drv.ms", "onedrive.live.com",
 }
-
-_GEMINI_MODEL = os.environ.get("URL_RESOLVER_MODEL", "gemini-2.5-flash-preview-05-20")
-
-_SYSTEM_PROMPT = """You are an audio URL resolver. Given the HTML source of a web page that hosts audio content,
-extract the direct download or streaming URL for the audio file (MP3, WAV, FLAC, AAC, OGG, M4A).
-
-Look for:
-- <audio> tags with src attributes
-- <source> tags inside <audio> elements
-- JavaScript variables containing CDN URLs (e.g., "https://cdn...mp3")
-- Open Graph meta tags (og:audio, og:video with audio MIME types)
-- JSON-LD or data attributes containing audio URLs
-- API endpoints that return audio streams
-
-Return ONLY the direct URL. No explanation. No markdown. Just the raw URL.
-If multiple audio URLs are found, return the highest quality one (WAV > FLAC > MP3).
-If no audio URL is found, return exactly: NO_AUDIO_FOUND"""
 
 
 def is_known_provider(url: str) -> bool:
-    """Check if the URL is from a known audio hosting provider."""
     try:
         host = urlparse(url).hostname or ""
         return any(known in host for known in _KNOWN_AUDIO_HOSTS)
@@ -57,124 +43,246 @@ def is_known_provider(url: str) -> bool:
 
 
 def _looks_like_direct_audio(url: str) -> bool:
-    """Check if URL likely points directly to an audio file."""
     path = urlparse(url).path.lower()
-    return any(path.endswith(ext) for ext in ('.wav', '.flac', '.aiff', '.aif', '.mp3', '.ogg', '.m4a', '.aac'))
+    return any(path.endswith(ext) for ext in (
+        '.wav', '.flac', '.aiff', '.aif', '.mp3', '.ogg', '.m4a', '.aac',
+    ))
 
 
-async def resolve_audio_url(url: str) -> str:
-    """Resolve an arbitrary URL to a direct audio download URL.
-
-    For known providers, returns the URL as-is (handled by normalize_audio_url).
-    For unknown URLs, fetches the page and uses Gemini to extract the audio URL.
+async def resolve_audio_url(url: str) -> dict:
+    """Resolve an arbitrary URL to audio data.
 
     Returns:
-        Direct audio URL string
-
-    Raises:
-        ValueError: If no audio URL could be found
+        {"type": "url", "value": "https://..."} or
+        {"type": "file", "value": "/tmp/.../audio.wav"}
     """
-    # Skip resolution for known providers and direct audio links
     if is_known_provider(url) or _looks_like_direct_audio(url):
-        return url
+        return {"type": "url", "value": url}
 
     logger.info(f"Unknown audio source, resolving: {url}")
 
-    # Try yt-dlp first (supports Suno, YouTube, SoundCloud, 1000+ sites)
+    # 1. Suno special — extract CDN link, download & convert to WAV
+    if "suno.com" in url:
+        try:
+            local_wav = await _resolve_suno(url)
+            if local_wav:
+                return {"type": "file", "value": local_wav}
+        except Exception as e:
+            logger.warning(f"Suno direct extraction failed: {e}")
+
+    # 2. yt-dlp extract_info (get URL without downloading)
     try:
-        return await _resolve_with_ytdlp(url)
+        direct = await _ytdlp_extract_url(url)
+        if direct:
+            return {"type": "url", "value": direct}
     except Exception as e:
-        logger.info(f"yt-dlp failed ({e}), falling back to Gemini")
+        logger.info(f"yt-dlp URL extraction failed: {e}")
 
-    # Fallback: Gemini HTML scraping
+    # 3. yt-dlp download to local WAV
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
-            resp.raise_for_status()
-            html = resp.text
+        local_path = await _ytdlp_download(url)
+        if local_path:
+            return {"type": "file", "value": local_path}
     except Exception as e:
-        raise ValueError(f"Failed to fetch page at {url}: {e}")
+        logger.info(f"yt-dlp download failed: {e}")
 
-    # Truncate HTML to avoid token limits (keep first 30k chars)
-    html_truncated = html[:30000]
+    # 4. Gemini HTML scraping (final fallback)
+    try:
+        direct = await _resolve_with_gemini(url)
+        if direct:
+            return {"type": "url", "value": direct}
+    except Exception as e:
+        logger.warning(f"Gemini resolution failed: {e}")
 
-    # Ask Gemini to extract the audio URL
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY not set — cannot resolve unknown audio URLs")
+    raise ValueError(
+        f"Cannot resolve audio from: {url}. "
+        "Tried: Suno CDN, yt-dlp, Gemini. "
+        "Please provide a direct audio URL or Google Drive/Dropbox link."
+    )
+
+
+async def _resolve_suno(url: str) -> str | None:
+    """Extract CDN link from Suno, download MP3, convert to WAV."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        resp = await client.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        resp.raise_for_status()
+
+        direct_url = None
+        for pattern in [
+            r'property="og:audio"\s+content="([^"]+)"',
+            r'content="([^"]*cdn[^"]*\.(?:mp3|wav|m4a|ogg))"',
+            r'"audio_url"\s*:\s*"([^"]+)"',
+            r'"download_url"\s*:\s*"([^"]+)"',
+            r'"mp3_url"\s*:\s*"([^"]+)"',
+        ]:
+            match = re.search(pattern, resp.text)
+            if match and match.group(1).startswith("http"):
+                direct_url = match.group(1)
+                break
+
+    if not direct_url:
+        return None
+
+    logger.info(f"Suno CDN found: {direct_url[:80]}...")
+    return await _download_and_convert_to_wav(direct_url)
+
+
+async def _download_and_convert_to_wav(direct_url: str) -> str:
+    """Download audio from CDN and convert to WAV via FFmpeg."""
+    fd_src, temp_src = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd_src)
+    fd_wav, temp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd_wav)
 
     try:
-        gemini = genai.Client(api_key=api_key)
-        response = gemini.models.generate_content(
-            model=_GEMINI_MODEL,
-            contents=[f"Extract the direct audio URL from this page HTML:\n\nURL: {url}\n\nHTML:\n{html_truncated}"],
-            config=genai.types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                temperature=0.0,
-            ),
+        # Download with browser-like headers
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://suno.com/",
+        }
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", direct_url, headers=headers) as resp:
+                resp.raise_for_status()
+                with open(temp_src, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+
+        src_size = os.path.getsize(temp_src)
+        if src_size < 10000:
+            raise ValueError(f"Downloaded file too small ({src_size}B)")
+
+        logger.info(f"Downloaded {src_size / 1024:.0f}KB, converting to WAV...")
+
+        # Convert to 24bit/48kHz WAV via FFmpeg
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-i", temp_src,
+             "-vn", "-acodec", "pcm_s24le", "-ar", "48000",
+             temp_wav],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        result = (response.text or "").strip()
+
+        wav_size = os.path.getsize(temp_wav)
+        logger.info(f"WAV converted: {wav_size / 1024 / 1024:.1f}MB")
+        return temp_wav
+
     except Exception as e:
-        raise ValueError(f"Gemini URL resolution failed: {e}")
-
-    if not result or result == "NO_AUDIO_FOUND":
-        # Gemini couldn't find it — try yt-dlp as last resort
-        logger.info(f"Gemini failed, trying yt-dlp for: {url}")
-        return await _resolve_with_ytdlp(url)
-
-    # Validate the extracted URL
-    extracted = result.split('\n')[0].strip()
-    if not extracted.startswith("http"):
-        # Invalid Gemini result — try yt-dlp
-        logger.info(f"Gemini returned invalid URL, trying yt-dlp for: {url}")
-        return await _resolve_with_ytdlp(url)
-
-    logger.info(f"Resolved audio URL: {extracted[:80]}...")
-    return extracted
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
+        raise RuntimeError(f"Download/convert failed: {e}")
+    finally:
+        if os.path.exists(temp_src):
+            os.remove(temp_src)
 
 
-async def _resolve_with_ytdlp(url: str) -> str:
-    """Use yt-dlp to download audio and return local file path.
-
-    yt-dlp supports Suno, YouTube, SoundCloud, BandCamp, and 1000+ sites.
-    Downloads to a temp WAV file and returns the file:// path.
-    """
+async def _ytdlp_extract_url(url: str) -> str | None:
+    """Use yt-dlp to get direct streaming URL without downloading."""
     try:
         import yt_dlp
     except ImportError:
-        raise ValueError(
-            f"Cannot resolve {url}: yt-dlp not installed and Gemini failed. "
-            "Please provide a direct audio URL."
-        )
+        return None
+
+    def _extract():
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and "url" in info:
+                return info["url"]
+            if info and "formats" in info:
+                # Find best audio format
+                audio_fmts = [
+                    f for f in info["formats"]
+                    if f.get("acodec") != "none" and f.get("url")
+                ]
+                if audio_fmts:
+                    best = max(audio_fmts, key=lambda f: f.get("abr", 0) or 0)
+                    return best["url"]
+        return None
+
+    result = await asyncio.to_thread(_extract)
+    if result:
+        logger.info(f"yt-dlp URL extracted: {result[:80]}...")
+    return result
+
+
+async def _ytdlp_download(url: str) -> str | None:
+    """Download audio to local WAV via yt-dlp + ffmpeg."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
 
     tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
     out_template = os.path.join(tmp_dir, "audio.%(ext)s")
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": out_template,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
-        "quiet": True,
-        "no_warnings": True,
-    }
-
     def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL({
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+            }],
+            "quiet": True,
+            "no_warnings": True,
+        }) as ydl:
             ydl.download([url])
 
     await asyncio.to_thread(_download)
 
-    # Find the downloaded file
     for f in os.listdir(tmp_dir):
         if f.endswith(".wav"):
-            result_path = os.path.join(tmp_dir, f)
-            logger.info(f"yt-dlp resolved: {result_path}")
-            return result_path
+            path = os.path.join(tmp_dir, f)
+            size = os.path.getsize(path)
+            if size < 50000:  # 50KB = likely HTML, not audio
+                logger.warning(f"yt-dlp file too small ({size}B), likely not audio")
+                os.remove(path)
+                return None
+            logger.info(f"yt-dlp downloaded: {path} ({size / 1024:.0f}KB)")
+            return path
 
-    raise ValueError(f"yt-dlp downloaded but no WAV found in {tmp_dir}")
+    return None
+
+
+async def _resolve_with_gemini(url: str) -> str | None:
+    """Fetch page HTML and ask Gemini to find the audio URL."""
+    from google import genai
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            })
+            resp.raise_for_status()
+            html = resp.text[:30000]
+    except Exception:
+        return None
+
+    gemini = genai.Client(api_key=api_key)
+    model = os.environ.get("URL_RESOLVER_MODEL", "gemini-2.5-flash-preview-05-20")
+
+    response = gemini.models.generate_content(
+        model=model,
+        contents=[
+            f"Extract the direct audio URL from this HTML:\n\nURL: {url}\n\nHTML:\n{html}"
+        ],
+        config=genai.types.GenerateContentConfig(
+            system_instruction=(
+                "Return ONLY the direct audio URL (mp3/wav/flac/m4a). "
+                "No explanation. If not found, return NO_AUDIO_FOUND"
+            ),
+            temperature=0.0,
+        ),
+    )
+    result = (response.text or "").strip().split("\n")[0]
+    if result and result != "NO_AUDIO_FOUND" and result.startswith("http"):
+        logger.info(f"Gemini resolved: {result[:80]}...")
+        return result
+    return None

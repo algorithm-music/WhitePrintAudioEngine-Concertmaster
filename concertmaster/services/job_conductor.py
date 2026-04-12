@@ -26,9 +26,32 @@ from concertmaster.clients import audition_client, deliberation_client, renditio
 from concertmaster.clients.http_pool import get_client
 from concertmaster.services.url_resolver import resolve_audio_url, is_known_provider
 
+import os
+
 logger = logging.getLogger("concertmaster.conductor")
 
 FETCH_TIMEOUT = 60.0  # 60s to download audio from external URL
+
+
+def _get_audio_url(resolved: dict) -> str:
+    """Get the audio URL from resolved data. For local files, convert to file:// URL."""
+    if resolved["type"] == "url":
+        return resolved["value"]
+    # For local files, we need to upload to Audition differently
+    # For now, use file:// scheme — Audition will need to handle this
+    return resolved["value"]
+
+
+def _cleanup_resolved(resolved: dict):
+    """Clean up local files after processing."""
+    if resolved["type"] == "file" and os.path.exists(resolved["value"]):
+        try:
+            os.remove(resolved["value"])
+            parent = os.path.dirname(resolved["value"])
+            if parent.startswith("/tmp/ytdlp_"):
+                os.rmdir(parent)
+        except Exception:
+            pass
 MAX_AUDIO_SIZE = 200 * 1024 * 1024  # 200MB hard limit
 
 # ══════════════════════════════════════════
@@ -178,15 +201,22 @@ async def run_full(
     """Full route: analyze(url) → deliberation → fetch → rendition_dsp → return."""
     t0 = time.time()
 
-    # 0. Resolve unknown URLs (Suno, SoundCloud, etc.) via Gemini
-    resolved_url = await resolve_audio_url(audio_url)
+    # 0. Resolve unknown URLs (Suno, SoundCloud, etc.)
+    resolved = await resolve_audio_url(audio_url)
+    audio_path = _get_audio_url(resolved)
 
     # 1. Normalize URL for direct download + SSRF check
-    normalized_url = normalize_audio_url(resolved_url)
-    validate_url_safe(normalized_url)
+    if resolved["type"] == "url":
+        normalized_url = normalize_audio_url(audio_path)
+        validate_url_safe(normalized_url)
+    else:
+        normalized_url = audio_path  # local file
 
-    # 2. Analyze (audition fetches audio itself — no 32MB limit)
-    analysis = await audition_client.analyze(normalized_url)
+    # 2. Analyze
+    if resolved["type"] == "file":
+        analysis = await audition_client.analyze_file(normalized_url)
+    else:
+        analysis = await audition_client.analyze(normalized_url)
 
     # 3. Deliberation (3 sages → adopted_params via weighted median merge)
     deliberation_result = await deliberation_client.deliberate(
@@ -204,9 +234,9 @@ async def run_full(
         if "overrides" in dsp_config:
             dsp_params.update(dsp_config["overrides"])
 
-    # 4. RENDITION_DSP (fetches audio itself — no 32MB limit)
+    # 4. RENDITION_DSP
     mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
-        audio_url=normalized_url,
+        audio_url=normalized_url if resolved["type"] == "url" else resolved["value"],
         params=dsp_params,
         target_lufs=target_lufs,
         target_true_peak=target_true_peak,
@@ -214,6 +244,7 @@ async def run_full(
     )
 
     elapsed_ms = int((time.time() - t0) * 1000)
+    _cleanup_resolved(resolved)
 
     return {
         "route": "full",
@@ -228,10 +259,14 @@ async def run_full(
 async def run_analyze_only(audio_url: str) -> dict:
     """Analyze-only route: analyze(url) → return."""
     t0 = time.time()
-    resolved_url = await resolve_audio_url(audio_url)
-    normalized_url = normalize_audio_url(resolved_url)
-    validate_url_safe(normalized_url)
-    analysis = await audition_client.analyze(normalized_url)
+    resolved = await resolve_audio_url(audio_url)
+    if resolved["type"] == "file":
+        analysis = await audition_client.analyze_file(resolved["value"])
+        _cleanup_resolved(resolved)
+    else:
+        normalized_url = normalize_audio_url(resolved["value"])
+        validate_url_safe(normalized_url)
+        analysis = await audition_client.analyze(normalized_url)
     elapsed_ms = int((time.time() - t0) * 1000)
 
     return {
@@ -249,10 +284,14 @@ async def run_deliberation_only(
 ) -> dict:
     """Deliberation-only route: analyze(url) → deliberation → return."""
     t0 = time.time()
-    resolved_url = await resolve_audio_url(audio_url)
-    normalized_url = normalize_audio_url(resolved_url)
-    validate_url_safe(normalized_url)
-    analysis = await audition_client.analyze(normalized_url)
+    resolved = await resolve_audio_url(audio_url)
+    if resolved["type"] == "file":
+        analysis = await audition_client.analyze_file(resolved["value"])
+        _cleanup_resolved(resolved)
+    else:
+        normalized_url = normalize_audio_url(resolved["value"])
+        validate_url_safe(normalized_url)
+        analysis = await audition_client.analyze(normalized_url)
     deliberation_result = await deliberation_client.deliberate(
         analysis=analysis,
         target_lufs=target_lufs,
@@ -278,9 +317,15 @@ async def run_dsp_only(
 ) -> dict:
     """RENDITION_DSP-only route: rendition_dsp (manual params, fetches audio itself) → return."""
     t0 = time.time()
-    resolved_url = await resolve_audio_url(audio_url)
-    normalized_url = normalize_audio_url(resolved_url)
-    validate_url_safe(normalized_url)
+    resolved = await resolve_audio_url(audio_url)
+    if resolved["type"] == "file":
+        # TODO: rendition_dsp_client needs file upload support
+        # For now, this path won't work — Suno URLs go through full route
+        normalized_url = resolved["value"]
+        _cleanup_resolved(resolved)
+    else:
+        normalized_url = normalize_audio_url(resolved["value"])
+        validate_url_safe(normalized_url)
     mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
         audio_url=normalized_url,
         params=manual_params,
