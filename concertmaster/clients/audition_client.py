@@ -47,20 +47,26 @@ async def analyze(audio_url: str) -> dict:
 
 
 async def analyze_file(file_path: str) -> dict:
-    """Upload a local audio file to audition for analysis.
+    """Upload a local audio file to audition for analysis using chunked streaming.
 
-    Used when yt-dlp downloaded audio to a local temp file.
+    Used when yt-dlp downloaded audio to a local temp file. Bypasses 32MB Cloud Run HTTP/1 limits.
     """
-    url = f"{AUDITION_URL}/internal/analyze"
+    url = f"{AUDITION_URL}/internal/analyze-stream"
     headers = get_auth_header(AUDITION_URL)
+    headers["Content-Type"] = "application/octet-stream"
 
     client = get_client()
-    with open(file_path, "rb") as f:
-        resp = await client.post(
-            url,
-            files={"file": ("audio.wav", f, "audio/wav")},
-            headers=headers,
-            timeout=TIMEOUT,
-        )
+
+    async def file_streamer():
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+
+    resp = await client.post(
+        url,
+        content=file_streamer(),
+        headers=headers,
+        timeout=TIMEOUT,
+    )
     resp.raise_for_status()
     return resp.json()

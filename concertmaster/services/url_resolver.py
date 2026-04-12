@@ -149,8 +149,11 @@ async def _download_gdrive(url: str) -> str | None:
 
             resp.raise_for_status()
 
+            resp.raise_for_status()
+
             with open(temp_raw, "wb") as f:
-                f.write(resp.content)
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    f.write(chunk)
 
         sz = os.path.getsize(temp_raw)
         if sz < 50000:

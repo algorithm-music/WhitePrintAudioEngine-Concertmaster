@@ -235,13 +235,22 @@ async def run_full(
             dsp_params.update(dsp_config["overrides"])
 
     # 4. RENDITION_DSP
-    mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
-        audio_url=normalized_url if resolved["type"] == "url" else resolved["value"],
-        params=dsp_params,
-        target_lufs=target_lufs,
-        target_true_peak=target_true_peak,
-        output_url=output_url,
-    )
+    if resolved["type"] == "file":
+        mastered_bytes, dsp_metrics = await rendition_dsp_client.master_file(
+            file_path=normalized_url,
+            params=dsp_params,
+            target_lufs=target_lufs,
+            target_true_peak=target_true_peak,
+            output_url=output_url,
+        )
+    else:
+        mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
+            audio_url=normalized_url,
+            params=dsp_params,
+            target_lufs=target_lufs,
+            target_true_peak=target_true_peak,
+            output_url=output_url,
+        )
 
     elapsed_ms = int((time.time() - t0) * 1000)
     _cleanup_resolved(resolved)
