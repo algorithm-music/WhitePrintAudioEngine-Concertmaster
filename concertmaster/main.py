@@ -19,12 +19,15 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Depends, Security
+from fastapi import FastAPI, File, HTTPException, Request, Depends, Security, UploadFile
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional
+
+import google.auth
+from google.auth.transport.requests import Request as GAuthRequest
 
 from concertmaster.clients.http_pool import init_pool, close_pool
 from concertmaster.services import job_conductor
@@ -60,17 +63,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS — allow browser uploads from any origin (Vercel, localhost, etc)
 _cors_origins = os.environ.get("CORS_ORIGINS", "").split(",")
 _cors_origins = [o.strip() for o in _cors_origins if o.strip()]
-if _cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Request-Id", "X-Api-Key"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-Id", "X-Api-Key"],
+)
 
 
 # ──────────────────────────────────────────
@@ -164,6 +166,106 @@ async def health():
         "status": "ok",
         "service": "concertmaster",
         "stores_audio": False,
+    }
+
+
+# ──────────────────────────────────────────
+# File Upload → GCS
+# ──────────────────────────────────────────
+GCS_SOURCE_BUCKET = os.environ.get("GCS_SOURCE_BUCKET", "aidriven-mastering-fyqu-source-bucket")
+MAX_UPLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
+
+ALLOWED_AUDIO_TYPES = {
+    "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/flac", "audio/x-flac",
+    "audio/aiff", "audio/x-aiff",
+    "audio/mpeg", "audio/mp3",
+    "application/octet-stream",  # fallback for unknown mime
+}
+
+
+def _get_gcs_access_token() -> str:
+    """Get GCS access token via Application Default Credentials (metadata server on Cloud Run)."""
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
+    )
+    credentials.refresh(GAuthRequest())
+    return credentials.token
+
+
+@app.post("/api/v1/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload audio file directly to GCS source bucket.
+
+    Browsers call this endpoint directly (bypasses Vercel 4.5MB limit).
+    Returns the public GCS URL for pipeline consumption.
+    No API key required — files are temporary and auto-cleaned.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+
+    # Validate content type
+    content_type = (file.content_type or "application/octet-stream").lower()
+
+    # Read file into memory
+    data = await file.read()
+
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {len(data) / 1024 / 1024:.1f}MB. Max is {MAX_UPLOAD_SIZE / 1024 / 1024:.0f}MB.",
+        )
+
+    if len(data) < 44:
+        raise HTTPException(status_code=400, detail="File too small to be valid audio.")
+
+    # Generate unique object name
+    timestamp = __import__("time").time()
+    random_suffix = uuid.uuid4().hex[:8]
+    import re
+    safe_name = re.sub(r"[^a-zA-Z0-9._\-\u3000-\u9FFF\uF900-\uFAFF]", "_", file.filename)
+    object_name = f"uploads/{int(timestamp)}-{random_suffix}/{safe_name}"
+
+    # Upload to GCS using JSON API
+    try:
+        access_token = _get_gcs_access_token()
+
+        upload_url = (
+            f"https://storage.googleapis.com/upload/storage/v1/b/"
+            f"{GCS_SOURCE_BUCKET}/o?uploadType=media&name={object_name}"
+        )
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                upload_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": content_type,
+                },
+                content=data,
+            )
+
+        if resp.status_code not in (200, 201):
+            logger.error(f"[upload] GCS upload failed: {resp.status_code} {resp.text}")
+            raise HTTPException(status_code=502, detail="Failed to upload file to storage.")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[upload] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+
+    # Construct public URL
+    from urllib.parse import quote
+    gcs_url = f"https://storage.googleapis.com/{GCS_SOURCE_BUCKET}/{quote(object_name, safe='/')}"
+
+    logger.info(f"[upload] Success: {file.filename} ({len(data) / 1024 / 1024:.1f}MB) → {gcs_url}")
+
+    return {
+        "url": gcs_url,
+        "object_name": object_name,
+        "file_name": file.filename,
+        "file_size": len(data),
     }
 
 
