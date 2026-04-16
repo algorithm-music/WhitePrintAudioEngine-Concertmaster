@@ -3,7 +3,6 @@ fastapi>=0.115.0,<1.0
 uvicorn[standard]>=0.34.0,<1.0
 pydantic>=2.10.0,<3.0
 httpx>=0.28.0,<1.0
-python-multipart>=0.0.20,<1.0
 
 # Service-to-service OIDC auth (Cloud Run)
 google-auth>=2.0,<3.0
@@ -14,3 +13,6 @@ google-genai>=1.14,<2.0
 
 # yt-dlp — Universal audio downloader (Suno, YouTube, SoundCloud, 1000+ sites)
 yt-dlp>=2024.0
+
+# Multipart form processing for audio uploads
+python-multipart>=0.0.12,<1.0
