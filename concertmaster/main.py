@@ -91,10 +91,20 @@ async def request_id_middleware(request: Request, call_next):
 # Request / Response Models
 # ──────────────────────────────────────────
 class MasterRequest(BaseModel):
-    audio_url: str = Field(
-        ...,
-        description="Direct download URL (Dropbox, Google Drive, OneDrive, S3, any HTTPS)",
+    audio_url: Optional[str] = Field(
+        None,
+        description="Direct download URL. Use this OR input_path. URL path downloads via HTTP.",
         examples=["https://www.dropbox.com/s/abc123/track.wav?dl=1"],
+    )
+    input_path: Optional[str] = Field(
+        None,
+        description="Absolute path to input audio on the shared GCSFuse mount. Preferred — no HTTP transfer, no 32 MiB limits.",
+        examples=["/mnt/gcs/aimastering-tmp-audio/uploads/user-123/abc.wav"],
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Absolute path for the mastered output on the shared GCSFuse mount. When set, rendition-dsp writes directly (no HTTP response body).",
+        examples=["/mnt/gcs/aimastering-tmp-audio/outputs/user-123/abc-master.wav"],
     )
     route: str = Field(
         "full",
@@ -116,7 +126,7 @@ class MasterRequest(BaseModel):
     )
     output_url: Optional[str] = Field(
         None,
-        description="Signed PUT URL to upload result directly (bypasses memory and HTTP return size limits)",
+        description="Legacy: signed PUT URL for rendition-dsp to upload result. Prefer output_path.",
     )
 
 
@@ -284,24 +294,34 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
     """
     route = req.route.lower().strip()
 
+    if not req.input_path and not req.audio_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either input_path (shared GCSFuse mount) or audio_url is required.",
+        )
+
+    # When the caller writes output to a shared path (or a signed PUT URL),
+    # concertmaster responds with JSON metrics instead of the WAV bytes.
+    output_is_out_of_band = bool(req.output_path or req.output_url)
+
     try:
         if route == "full":
             result = await job_conductor.run_full(
                 audio_url=req.audio_url,
+                input_path=req.input_path,
+                output_path=req.output_path,
                 target_lufs=req.target_lufs,
                 target_true_peak=req.target_true_peak,
                 sage_config=req.sage_config,
                 dsp_config=req.dsp_config,
                 output_url=req.output_url,
             )
-            
+
             mastered = result.pop("mastered_audio", None)
-            
-            if req.output_url:
-                # Result was uploaded to storage, return JSON
+
+            if output_is_out_of_band:
                 return JSONResponse(content=result)
             else:
-                # Return mastered WAV as binary response
                 return Response(
                     content=mastered,
                     media_type="audio/wav",
@@ -317,12 +337,14 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
         elif route == "analyze_only":
             result = await job_conductor.run_analyze_only(
                 audio_url=req.audio_url,
+                input_path=req.input_path,
             )
             return JSONResponse(content=result)
 
         elif route == "deliberation_only":
             result = await job_conductor.run_deliberation_only(
                 audio_url=req.audio_url,
+                input_path=req.input_path,
                 target_lufs=req.target_lufs,
                 target_true_peak=req.target_true_peak,
                 sage_config=req.sage_config,
@@ -337,16 +359,17 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
                 )
             result = await job_conductor.run_dsp_only(
                 audio_url=req.audio_url,
+                input_path=req.input_path,
+                output_path=req.output_path,
                 manual_params=req.manual_params,
                 target_lufs=req.target_lufs,
                 target_true_peak=req.target_true_peak,
                 output_url=req.output_url,
             )
-            
+
             mastered = result.pop("mastered_audio", None)
-            
-            if req.output_url:
-                # Result was uploaded to storage, return JSON
+
+            if output_is_out_of_band:
                 return JSONResponse(content=result)
             else:
                 return Response(

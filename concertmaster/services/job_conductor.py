@@ -191,26 +191,37 @@ async def fetch_audio(url: str) -> bytes:
 # Pipeline Routes
 # ══════════════════════════════════════════
 async def run_full(
-    audio_url: str,
-    target_lufs: float,
-    target_true_peak: float,
+    audio_url: str | None = None,
+    target_lufs: float = -14.0,
+    target_true_peak: float = -1.0,
     sage_config: dict | None = None,
     dsp_config: dict | None = None,
+    input_path: str | None = None,
+    output_path: str | None = None,
     output_url: str | None = None,
 ) -> dict:
-    """Full route: analyze(url) → deliberation → fetch → rendition_dsp → return."""
+    """Full route: analyze → deliberation → rendition_dsp.
+
+    Input selection:
+      - input_path: absolute local path on the shared GCSFuse mount. Preferred.
+      - audio_url:  remote URL; resolved and (if needed) downloaded first.
+    """
     t0 = time.time()
 
-    # 0. Resolve unknown URLs (Suno, SoundCloud, etc.)
-    resolved = await resolve_audio_url(audio_url)
-    audio_path = _get_audio_url(resolved)
-
-    # 1. Normalize URL for direct download + SSRF check
-    if resolved["type"] == "url":
-        normalized_url = normalize_audio_url(audio_path)
-        validate_url_safe(normalized_url)
+    if input_path:
+        # Skip url_resolver — input is already on the mount.
+        resolved = {"type": "file", "value": input_path}
+        normalized_url = input_path
     else:
-        normalized_url = audio_path  # local file
+        if not audio_url:
+            raise ValueError("Either input_path or audio_url is required.")
+        resolved = await resolve_audio_url(audio_url)
+        audio_path = _get_audio_url(resolved)
+        if resolved["type"] == "url":
+            normalized_url = normalize_audio_url(audio_path)
+            validate_url_safe(normalized_url)
+        else:
+            normalized_url = audio_path
 
     # 2. Analyze
     if resolved["type"] == "file":
@@ -241,6 +252,7 @@ async def run_full(
             params=dsp_params,
             target_lufs=target_lufs,
             target_true_peak=target_true_peak,
+            output_path=output_path,
             output_url=output_url,
         )
     else:
@@ -253,7 +265,8 @@ async def run_full(
         )
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    _cleanup_resolved(resolved)
+    if not input_path:
+        _cleanup_resolved(resolved)
 
     return {
         "route": "full",
@@ -265,17 +278,25 @@ async def run_full(
     }
 
 
-async def run_analyze_only(audio_url: str) -> dict:
-    """Analyze-only route: analyze(url) → return."""
+async def run_analyze_only(
+    audio_url: str | None = None,
+    input_path: str | None = None,
+) -> dict:
+    """Analyze-only route: analyze → return."""
     t0 = time.time()
-    resolved = await resolve_audio_url(audio_url)
-    if resolved["type"] == "file":
-        analysis = await audition_client.analyze_file(resolved["value"])
-        _cleanup_resolved(resolved)
+    if input_path:
+        analysis = await audition_client.analyze_file(input_path)
     else:
-        normalized_url = normalize_audio_url(resolved["value"])
-        validate_url_safe(normalized_url)
-        analysis = await audition_client.analyze(normalized_url)
+        if not audio_url:
+            raise ValueError("Either input_path or audio_url is required.")
+        resolved = await resolve_audio_url(audio_url)
+        if resolved["type"] == "file":
+            analysis = await audition_client.analyze_file(resolved["value"])
+            _cleanup_resolved(resolved)
+        else:
+            normalized_url = normalize_audio_url(resolved["value"])
+            validate_url_safe(normalized_url)
+            analysis = await audition_client.analyze(normalized_url)
     elapsed_ms = int((time.time() - t0) * 1000)
 
     return {
@@ -286,21 +307,27 @@ async def run_analyze_only(audio_url: str) -> dict:
 
 
 async def run_deliberation_only(
-    audio_url: str,
-    target_lufs: float,
-    target_true_peak: float,
+    audio_url: str | None = None,
+    target_lufs: float = -14.0,
+    target_true_peak: float = -1.0,
     sage_config: dict | None = None,
+    input_path: str | None = None,
 ) -> dict:
-    """Deliberation-only route: analyze(url) → deliberation → return."""
+    """Deliberation-only route: analyze → deliberation → return."""
     t0 = time.time()
-    resolved = await resolve_audio_url(audio_url)
-    if resolved["type"] == "file":
-        analysis = await audition_client.analyze_file(resolved["value"])
-        _cleanup_resolved(resolved)
+    if input_path:
+        analysis = await audition_client.analyze_file(input_path)
     else:
-        normalized_url = normalize_audio_url(resolved["value"])
-        validate_url_safe(normalized_url)
-        analysis = await audition_client.analyze(normalized_url)
+        if not audio_url:
+            raise ValueError("Either input_path or audio_url is required.")
+        resolved = await resolve_audio_url(audio_url)
+        if resolved["type"] == "file":
+            analysis = await audition_client.analyze_file(resolved["value"])
+            _cleanup_resolved(resolved)
+        else:
+            normalized_url = normalize_audio_url(resolved["value"])
+            validate_url_safe(normalized_url)
+            analysis = await audition_client.analyze(normalized_url)
     deliberation_result = await deliberation_client.deliberate(
         analysis=analysis,
         target_lufs=target_lufs,
@@ -318,35 +345,53 @@ async def run_deliberation_only(
 
 
 async def run_dsp_only(
-    audio_url: str,
-    manual_params: dict,
-    target_lufs: float,
-    target_true_peak: float,
+    audio_url: str | None = None,
+    manual_params: dict | None = None,
+    target_lufs: float = -14.0,
+    target_true_peak: float = -1.0,
+    input_path: str | None = None,
+    output_path: str | None = None,
     output_url: str | None = None,
 ) -> dict:
-    """RENDITION_DSP-only route: rendition_dsp (manual params, fetches audio itself) → return."""
+    """RENDITION_DSP-only route: rendition_dsp (manual params) → return."""
     t0 = time.time()
-    resolved = await resolve_audio_url(audio_url)
-    if resolved["type"] == "file":
+    params = manual_params or {}
+    if input_path:
         mastered_bytes, dsp_metrics = await rendition_dsp_client.master_file(
-            file_path=resolved["value"],
-            params=manual_params,
+            file_path=input_path,
+            params=params,
             target_lufs=target_lufs,
             target_true_peak=target_true_peak,
+            output_path=output_path,
             output_url=output_url,
         )
+        resolved = None
     else:
-        normalized_url = normalize_audio_url(resolved["value"])
-        validate_url_safe(normalized_url)
-        mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
-            audio_url=normalized_url,
-            params=manual_params,
-            target_lufs=target_lufs,
-            target_true_peak=target_true_peak,
-            output_url=output_url,
-        )
+        if not audio_url:
+            raise ValueError("Either input_path or audio_url is required.")
+        resolved = await resolve_audio_url(audio_url)
+        if resolved["type"] == "file":
+            mastered_bytes, dsp_metrics = await rendition_dsp_client.master_file(
+                file_path=resolved["value"],
+                params=params,
+                target_lufs=target_lufs,
+                target_true_peak=target_true_peak,
+                output_path=output_path,
+                output_url=output_url,
+            )
+        else:
+            normalized_url = normalize_audio_url(resolved["value"])
+            validate_url_safe(normalized_url)
+            mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
+                audio_url=normalized_url,
+                params=params,
+                target_lufs=target_lufs,
+                target_true_peak=target_true_peak,
+                output_url=output_url,
+            )
     elapsed_ms = int((time.time() - t0) * 1000)
-    _cleanup_resolved(resolved)
+    if resolved is not None:
+        _cleanup_resolved(resolved)
 
     return {
         "route": "dsp_only",

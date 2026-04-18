@@ -81,11 +81,20 @@ async def master_file(
     params: dict,
     target_lufs: float,
     target_true_peak: float,
+    output_path: str | None = None,
     output_url: str | None = None,
 ) -> tuple[bytes | None, dict]:
-    """Send audio file path and params to RENDITION_DSP.
+    """Send audio file path + params to RENDITION_DSP.
 
-    By using local paths on the GCS FUSE mount, we bypass HTTP payload limits.
+    Both input and (optional) output paths must live on the shared GCSFuse
+    mount so rendition-dsp can read/write without any HTTP transfer.
+
+    Parameter precedence:
+      - output_path: rendition-dsp writes the mastered WAV to this path and
+        returns JSON with metrics. Preferred.
+      - output_url:  rendition-dsp PUTs the mastered WAV to this signed URL.
+      - neither:     rendition-dsp streams the WAV back in the HTTP response
+        body (subject to Cloud Run's 32 MiB limit).
     """
     url = f"{RENDITION_DSP_URL}/internal/master"
     headers = get_auth_header(RENDITION_DSP_URL)
@@ -93,28 +102,17 @@ async def master_file(
 
     client = get_client()
 
-    req_body = {
+    req_body: dict = {
         "local_path": file_path,
         "params": params,
         "target_lufs": target_lufs,
         "target_true_peak": target_true_peak,
     }
-    
+    if output_path:
+        req_body["output_path"] = output_path
     if output_url:
         req_body["output_url"] = output_url
 
-    # If an output_url (signed PUT URL) is provided, we can either have Rendition DSP push it
-    # directly using X-Output-URL or we continue reading the response bytes here.
-    # We will let Rendition DSP return the master file path by passing output_path,
-    # OR we can let Rendition DSP stream it back.
-    # Right now, Rendition supports returning paths if we pass output_path. We will just stream back normally for now,
-    # unless we want to use the output_url mechanism.
-    
-    # Wait, earlier we allowed Rendition to upload it itself, let's keep the stream return for now
-    # but the new /internal/master doesn't support output_url pushing yet?
-    # Actually wait, `master_file` in Concertmaster pushes to Supabase afterwards!
-    
-    # Let's request Rendition to stream back the bytes, so Concertmaster pushes it to Supabase.
     resp = await client.post(
         url,
         json=req_body,
@@ -122,6 +120,11 @@ async def master_file(
         timeout=TIMEOUT,
     )
     resp.raise_for_status()
+
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        # output_path or output_url was honored — only metrics came back.
+        data = resp.json()
+        return None, data.get("metrics", {})
 
     metrics_raw = resp.headers.get("X-Metrics", "{}")
     try:
