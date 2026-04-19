@@ -5,26 +5,32 @@ The only externally-facing service. Orchestrates the full pipeline:
   audio_url → audition → deliberation → merge_rule → rendition_dsp → mastered WAV
 
 API:
-  POST /api/v1/jobs/master  — Submit mastering job
-  GET  /health              — Liveness probe
+  POST /api/v1/jobs/master       — Queue a mastering job, returns {job_id} immediately
+  GET  /api/v1/jobs/{job_id}     — Poll job status + result
+  GET  /health                   — Liveness probe
 
-Stores nothing. Remembers nothing. Returns everything.
+Jobs run as FastAPI BackgroundTasks; state lives in an in-process dict
+keyed by job_id so the caller is not holding a ~10-minute HTTP connection
+open. Restarting the container drops in-flight jobs by design — restart
+is a loud signal and the caller retries.
 """
 
+import asyncio
 import json
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, Depends, Security, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Depends, Security, UploadFile
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
-from typing import Optional
 
 import google.auth
 from google.auth.transport.requests import Request as GAuthRequest
@@ -279,18 +285,165 @@ async def upload_file(file: UploadFile = File(...)):
     }
 
 
-@app.post("/api/v1/jobs/master")
-async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
-    """Submit a mastering job.
+# ──────────────────────────────────────────
+# Async Job Store
+# ──────────────────────────────────────────
+# In-process state, keyed by job_id. The caller polls GET
+# /api/v1/jobs/{job_id} instead of holding a ~10-minute HTTP connection
+# open. If the container dies we lose state by design — that's a loud
+# signal the caller retries from. For durable job state, back this with
+# Firestore or the Supabase jobs row already present upstream.
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_LOCK = asyncio.Lock()
+_JOB_TTL_SECONDS = 60 * 60 * 4  # 4 h — output_url signed for 1 h anyway.
 
-    Paste a shared audio URL. Select a route. Get results.
-    No upload. No storage. No account required.
+
+async def _prune_jobs() -> None:
+    """Drop jobs older than _JOB_TTL_SECONDS so we don't grow unbounded."""
+    now = time.time()
+    async with _JOBS_LOCK:
+        stale = [jid for jid, j in _JOBS.items() if now - j.get("updated_at", now) > _JOB_TTL_SECONDS]
+        for jid in stale:
+            _JOBS.pop(jid, None)
+
+
+async def _set_job(job_id: str, **patch: Any) -> None:
+    async with _JOBS_LOCK:
+        j = _JOBS.setdefault(job_id, {})
+        j.update(patch)
+        j["updated_at"] = time.time()
+
+
+async def _run_pipeline(job_id: str, req: "MasterRequest") -> None:
+    """Run the configured route to completion and store the result."""
+    route = req.route.lower().strip()
+    await _set_job(job_id, status="processing", stage=route)
+    try:
+        if route == "full":
+            result = await job_conductor.run_full(
+                audio_url=req.audio_url,
+                input_path=req.input_path,
+                output_path=req.output_path,
+                target_lufs=req.target_lufs,
+                target_true_peak=req.target_true_peak,
+                sage_config=req.sage_config,
+                dsp_config=req.dsp_config,
+                output_url=req.output_url,
+            )
+            # The out-of-band output path / upload URL means no bytes travel
+            # back through this API; we only keep the metadata.
+            result.pop("mastered_audio", None)
+        elif route == "analyze_only":
+            result = await job_conductor.run_analyze_only(
+                audio_url=req.audio_url,
+                input_path=req.input_path,
+            )
+        elif route == "deliberation_only":
+            result = await job_conductor.run_deliberation_only(
+                audio_url=req.audio_url,
+                input_path=req.input_path,
+                target_lufs=req.target_lufs,
+                target_true_peak=req.target_true_peak,
+                sage_config=req.sage_config,
+            )
+        elif route == "dsp_only":
+            if not req.manual_params:
+                raise ValueError("manual_params required for dsp_only route")
+            result = await job_conductor.run_dsp_only(
+                audio_url=req.audio_url,
+                input_path=req.input_path,
+                output_path=req.output_path,
+                manual_params=req.manual_params,
+                target_lufs=req.target_lufs,
+                target_true_peak=req.target_true_peak,
+                output_url=req.output_url,
+            )
+            result.pop("mastered_audio", None)
+        else:
+            raise ValueError(
+                f"Unknown route: {route}. Use: full, analyze_only, deliberation_only, dsp_only",
+            )
+        await _set_job(job_id, status="completed", result=result)
+    except ValueError as e:
+        logger.error(f"[{job_id}] Pipeline rejected: {e}")
+        await _set_job(job_id, status="failed", http_status=422, error=str(e))
+    except httpx.TimeoutException:
+        logger.error(f"[{job_id}] Pipeline timeout", exc_info=True)
+        await _set_job(job_id, status="failed", http_status=504, error="Pipeline timed out.")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[{job_id}] Downstream service error: {e}", exc_info=True)
+        await _set_job(
+            job_id,
+            status="failed",
+            http_status=502,
+            error=f"Downstream service returned {e.response.status_code}",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"[{job_id}] Pipeline failed", exc_info=True)
+        await _set_job(job_id, status="failed", http_status=500, error=f"Internal pipeline error: {e}")
+
+
+@app.post("/api/v1/jobs/master", status_code=202)
+async def submit_master_job(
+    req: MasterRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_api_key),
+):
+    """Queue a mastering job and return its job_id immediately.
+
+    The caller then polls GET /api/v1/jobs/{job_id}.
 
     Routes:
-      full:          analyze → deliberation → rendition_dsp → mastered WAV
-      analyze_only:  analyze → analysis JSON
-      deliberation_only:  analyze → deliberation → formplan JSON
-      dsp_only:      rendition_dsp with manual_params → mastered WAV
+      full               analyze → deliberation → rendition_dsp
+      analyze_only       analyze → analysis JSON
+      deliberation_only  analyze → deliberation → formplan JSON
+      dsp_only           rendition_dsp with manual_params
+    """
+    if not req.input_path and not req.audio_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either input_path (shared GCSFuse mount) or audio_url is required.",
+        )
+    await _prune_jobs()
+    job_id = str(uuid.uuid4())
+    await _set_job(job_id, status="queued", route=req.route, created_at=time.time())
+    background_tasks.add_task(_run_pipeline, job_id, req)
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "queued", "route": req.route},
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}")
+async def get_job_status(job_id: str, api_key: str = Depends(verify_api_key)):
+    """Poll a queued/processing/completed/failed job.
+
+    Response shape:
+      { "job_id": "…", "status": "queued|processing|completed|failed",
+        "route": "…",
+        // when completed:
+        "result": { ... same shape as the old synchronous response ... },
+        // when failed:
+        "error": "…", "http_status": 502 | 422 | 504 | 500 }
+    """
+    async with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found (expired or never existed).")
+        snapshot = dict(job)
+    snapshot["job_id"] = job_id
+    return JSONResponse(content=snapshot)
+
+
+# ──────────────────────────────────────────
+# Legacy synchronous endpoint (kept during migration)
+# ──────────────────────────────────────────
+@app.post("/api/v1/jobs/master:sync")
+async def master_sync(req: MasterRequest, api_key: str = Depends(verify_api_key)):
+    """Blocking variant of master. Runs the pipeline to completion and
+    returns the full result in the same HTTP response. Kept so scripts /
+    curl callers that expect the old behaviour still work; the UI uses
+    the async submit + poll path above.
     """
     route = req.route.lower().strip()
 
@@ -300,8 +453,6 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
             detail="Either input_path (shared GCSFuse mount) or audio_url is required.",
         )
 
-    # When the caller writes output to a shared path (or a signed PUT URL),
-    # concertmaster responds with JSON metrics instead of the WAV bytes.
     output_is_out_of_band = bool(req.output_path or req.output_url)
 
     try:
@@ -316,31 +467,26 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
                 dsp_config=req.dsp_config,
                 output_url=req.output_url,
             )
-
             mastered = result.pop("mastered_audio", None)
-
             if output_is_out_of_band:
                 return JSONResponse(content=result)
-            else:
-                return Response(
-                    content=mastered,
-                    media_type="audio/wav",
-                    headers={
-                        "X-Route": "full",
-                        "X-Elapsed-Ms": str(result.get("elapsed_ms", 0)),
-                        "X-Analysis": _safe_json_header(result.get("analysis", {})),
-                        "X-Deliberation": _safe_json_header(result.get("deliberation", {})),
-                        "X-Metrics": _safe_json_header(result.get("dsp_metrics", {})),
-                    },
-                )
-
+            return Response(
+                content=mastered,
+                media_type="audio/wav",
+                headers={
+                    "X-Route": "full",
+                    "X-Elapsed-Ms": str(result.get("elapsed_ms", 0)),
+                    "X-Analysis": _safe_json_header(result.get("analysis", {})),
+                    "X-Deliberation": _safe_json_header(result.get("deliberation", {})),
+                    "X-Metrics": _safe_json_header(result.get("dsp_metrics", {})),
+                },
+            )
         elif route == "analyze_only":
             result = await job_conductor.run_analyze_only(
                 audio_url=req.audio_url,
                 input_path=req.input_path,
             )
             return JSONResponse(content=result)
-
         elif route == "deliberation_only":
             result = await job_conductor.run_deliberation_only(
                 audio_url=req.audio_url,
@@ -350,13 +496,9 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
                 sage_config=req.sage_config,
             )
             return JSONResponse(content=result)
-
         elif route == "dsp_only":
             if not req.manual_params:
-                raise HTTPException(
-                    status_code=400,
-                    detail="manual_params required for dsp_only route",
-                )
+                raise HTTPException(status_code=400, detail="manual_params required for dsp_only route")
             result = await job_conductor.run_dsp_only(
                 audio_url=req.audio_url,
                 input_path=req.input_path,
@@ -366,28 +508,23 @@ async def master(req: MasterRequest, api_key: str = Depends(verify_api_key)):
                 target_true_peak=req.target_true_peak,
                 output_url=req.output_url,
             )
-
             mastered = result.pop("mastered_audio", None)
-
             if output_is_out_of_band:
                 return JSONResponse(content=result)
-            else:
-                return Response(
-                    content=mastered,
-                    media_type="audio/wav",
-                    headers={
-                        "X-Route": "dsp_only",
-                        "X-Elapsed-Ms": str(result.get("elapsed_ms", 0)),
-                        "X-Metrics": _safe_json_header(result.get("dsp_metrics", {})),
-                    },
-                )
-
+            return Response(
+                content=mastered,
+                media_type="audio/wav",
+                headers={
+                    "X-Route": "dsp_only",
+                    "X-Elapsed-Ms": str(result.get("elapsed_ms", 0)),
+                    "X-Metrics": _safe_json_header(result.get("dsp_metrics", {})),
+                },
+            )
         else:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown route: {route}. Use: full, analyze_only, deliberation_only, dsp_only",
             )
-
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:
