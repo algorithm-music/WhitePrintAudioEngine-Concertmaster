@@ -15,7 +15,7 @@ DELIBERATION_URL = os.environ.get(
     "DELIBERATION_URL",
     "http://localhost:8082",
 )
-TIMEOUT = 180.0  # 3 minutes (3 LLM calls in parallel)
+TIMEOUT = 600.0  # 10 minutes (3 LLM calls in parallel)
 
 
 async def deliberate(
