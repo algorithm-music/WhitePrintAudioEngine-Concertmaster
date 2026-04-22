@@ -192,8 +192,8 @@ async def fetch_audio(url: str) -> bytes:
 # ══════════════════════════════════════════
 async def run_full(
     audio_url: str | None = None,
-    target_lufs: float = -6.0,
-    target_true_peak: float = -0.1,
+    target_lufs: float | None = None,
+    target_true_peak: float | None = None,
     sage_config: dict | None = None,
     dsp_config: dict | None = None,
     input_path: str | None = None,
@@ -294,8 +294,8 @@ async def run_full(
         if "overrides" in dsp_config:
             dsp_params.update(dsp_config["overrides"])
 
-    # Use AI-recommended targets: Deliberation (3-sage consensus) > Audition (Vertex AI listening) > defaults.
-    # Deliberation's adopted_params may refine what Audition initially recommended.
+    # Use AI-recommended targets: Deliberation (3-sage consensus) > Audition (Vertex AI listening).
+    # No hardcoded fallback — the AI MUST decide.
     effective_lufs = (
         dsp_params.pop("recommended_target_lufs", None)
         or analysis.get("recommended_target_lufs")
@@ -306,10 +306,14 @@ async def run_full(
         or analysis.get("recommended_target_true_peak")
         or target_true_peak
     )
-    ai_driven = (effective_lufs != target_lufs or effective_peak != target_true_peak)
+    if effective_lufs is None or effective_peak is None:
+        raise ValueError(
+            "AI pipeline did not provide target_lufs/target_true_peak. "
+            "Audition or Deliberation must determine these values."
+        )
     logger.info(
         f"DSP targets: LUFS={effective_lufs}, Peak={effective_peak} "
-        f"(AI-driven={ai_driven})"
+        f"(all AI-determined)"
     )
 
     # 4. RENDITION_DSP
@@ -375,8 +379,8 @@ async def run_analyze_only(
 
 async def run_deliberation_only(
     audio_url: str | None = None,
-    target_lufs: float = -6.0,
-    target_true_peak: float = -0.1,
+    target_lufs: float | None = None,
+    target_true_peak: float | None = None,
     sage_config: dict | None = None,
     input_path: str | None = None,
 ) -> dict:
@@ -414,8 +418,8 @@ async def run_deliberation_only(
 async def run_dsp_only(
     audio_url: str | None = None,
     manual_params: dict | None = None,
-    target_lufs: float = -6.0,
-    target_true_peak: float = -0.1,
+    target_lufs: float | None = None,
+    target_true_peak: float | None = None,
     input_path: str | None = None,
     output_path: str | None = None,
     output_url: str | None = None,
