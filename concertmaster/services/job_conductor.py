@@ -192,8 +192,8 @@ async def fetch_audio(url: str) -> bytes:
 # ══════════════════════════════════════════
 async def run_full(
     audio_url: str | None = None,
-    target_lufs: float = -14.0,
-    target_true_peak: float = -1.0,
+    target_lufs: float = -6.0,
+    target_true_peak: float = -0.1,
     sage_config: dict | None = None,
     dsp_config: dict | None = None,
     input_path: str | None = None,
@@ -375,8 +375,8 @@ async def run_analyze_only(
 
 async def run_deliberation_only(
     audio_url: str | None = None,
-    target_lufs: float = -14.0,
-    target_true_peak: float = -1.0,
+    target_lufs: float = -6.0,
+    target_true_peak: float = -0.1,
     sage_config: dict | None = None,
     input_path: str | None = None,
 ) -> dict:
@@ -414,8 +414,8 @@ async def run_deliberation_only(
 async def run_dsp_only(
     audio_url: str | None = None,
     manual_params: dict | None = None,
-    target_lufs: float = -14.0,
-    target_true_peak: float = -1.0,
+    target_lufs: float = -6.0,
+    target_true_peak: float = -0.1,
     input_path: str | None = None,
     output_path: str | None = None,
     output_url: str | None = None,
