@@ -1,10 +1,18 @@
 # WhitePrintAudioEngine — Concertmaster
 
-AI楽長（The Conductor）— The only externally-facing service.
+AI楽長（The Conductor）— パイプライン統括。唯一の外部公開サービス。
+
+## パイプライン
 
 ```
-audio_url → Audition → Deliberation → Rendition DSP → mastered WAV
+audio → Audition (Vertex AI) → Deliberation (3-Sage) → Rendition DSP → mastered WAV
 ```
+
+## 設計原則
+
+- **フォールバック値なし**: target_lufs / target_true_peak にデフォルトなし (None)
+- **AIが全て決定**: Audition が LUFS/True Peak を決定、Deliberation が DSP 全パラメータを決定
+- **AI未決定 = エラー**: フォールバックではなく ValueError で明示的に失敗
 
 ## API
 
@@ -25,7 +33,7 @@ audio_url → Audition → Deliberation → Rendition DSP → mastered WAV
 ## Deploy
 
 ```bash
-gcloud run deploy aimastering-concertmaster \
+gcloud run deploy whiteprintaudioengine-concertmaster \
   --source . --region asia-northeast1 --allow-unauthenticated
 ```
 
