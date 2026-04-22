@@ -369,8 +369,12 @@ async def _run_pipeline(job_id: str, req: "MasterRequest") -> None:
         logger.error(f"[{job_id}] Pipeline rejected: {e}")
         await _set_job(job_id, status="failed", http_status=422, error=str(e))
     except httpx.TimeoutException:
-        logger.error(f"[{job_id}] Pipeline timeout", exc_info=True)
-        await _set_job(job_id, status="failed", http_status=504, error="Pipeline timed out.")
+        # Include the current stage so the error message tells the user
+        # *where* the pipeline stalled.
+        async with _JOBS_LOCK:
+            current_stage = _JOBS.get(job_id, {}).get("stage", route)
+        logger.error(f"[{job_id}] Pipeline timeout at stage: {current_stage}", exc_info=True)
+        await _set_job(job_id, status="failed", http_status=504, error=f"Pipeline timed out at stage: {current_stage}")
     except httpx.HTTPStatusError as e:
         logger.error(f"[{job_id}] Downstream service error: {e}", exc_info=True)
         await _set_job(
