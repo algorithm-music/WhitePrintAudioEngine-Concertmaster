@@ -294,13 +294,31 @@ async def run_full(
         if "overrides" in dsp_config:
             dsp_params.update(dsp_config["overrides"])
 
+    # Use AI-recommended targets: Deliberation (3-sage consensus) > Audition (Vertex AI listening) > defaults.
+    # Deliberation's adopted_params may refine what Audition initially recommended.
+    effective_lufs = (
+        dsp_params.pop("recommended_target_lufs", None)
+        or analysis.get("recommended_target_lufs")
+        or target_lufs
+    )
+    effective_peak = (
+        dsp_params.pop("recommended_target_true_peak", None)
+        or analysis.get("recommended_target_true_peak")
+        or target_true_peak
+    )
+    ai_driven = (effective_lufs != target_lufs or effective_peak != target_true_peak)
+    logger.info(
+        f"DSP targets: LUFS={effective_lufs}, Peak={effective_peak} "
+        f"(AI-driven={ai_driven})"
+    )
+
     # 4. RENDITION_DSP
     if resolved["type"] == "file":
         mastered_bytes, dsp_metrics = await rendition_dsp_client.master_file(
             file_path=normalized_url,
             params=dsp_params,
-            target_lufs=target_lufs,
-            target_true_peak=target_true_peak,
+            target_lufs=effective_lufs,
+            target_true_peak=effective_peak,
             output_path=output_path,
             output_url=output_url,
         )
@@ -308,8 +326,8 @@ async def run_full(
         mastered_bytes, dsp_metrics = await rendition_dsp_client.master(
             audio_url=normalized_url,
             params=dsp_params,
-            target_lufs=target_lufs,
-            target_true_peak=target_true_peak,
+            target_lufs=effective_lufs,
+            target_true_peak=effective_peak,
             output_url=output_url,
         )
 
