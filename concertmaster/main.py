@@ -329,6 +329,7 @@ async def _run_pipeline(job_id: str, req: "MasterRequest") -> None:
                 sage_config=req.sage_config,
                 dsp_config=req.dsp_config,
                 output_url=req.output_url,
+                on_stage=lambda stage, data: _set_job(job_id, stage=stage, **data),
             )
             # The out-of-band output path / upload URL means no bytes travel
             # back through this API; we only keep the metadata.

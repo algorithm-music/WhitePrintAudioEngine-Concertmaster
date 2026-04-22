@@ -199,12 +199,16 @@ async def run_full(
     input_path: str | None = None,
     output_path: str | None = None,
     output_url: str | None = None,
+    on_stage=None,
 ) -> dict:
     """Full route: analyze → deliberation → rendition_dsp.
 
     Input selection:
       - input_path: absolute local path on the shared GCSFuse mount. Preferred.
       - audio_url:  remote URL; resolved and (if needed) downloaded first.
+
+    on_stage: optional async callback(stage: str, data: dict) called after each
+              pipeline stage completes, for real-time progress reporting.
     """
     t0 = time.time()
 
@@ -229,6 +233,29 @@ async def run_full(
     else:
         analysis = await audition_client.analyze(normalized_url)
 
+    # Emit analysis stage with real measured values
+    if on_stage:
+        metrics = analysis.get("whole_track_metrics", {})
+        guardrails = analysis.get("param_guardrails")
+        track_id = analysis.get("track_identity", {})
+        problems = analysis.get("detected_problems", [])
+        await on_stage("analysis_done", {
+            "intermediate": {
+                "track_identity": track_id,
+                "metrics": {
+                    "integrated_lufs": metrics.get("integrated_lufs"),
+                    "true_peak_dbtp": metrics.get("true_peak_dbtp"),
+                    "crest_db": metrics.get("crest_db"),
+                    "low_mono_correlation": metrics.get("low_mono_correlation_below_120hz"),
+                    "stereo_width_mean": metrics.get("stereo_width_mean"),
+                    "harshness_risk": metrics.get("harshness_risk"),
+                    "mud_risk": metrics.get("mud_risk"),
+                },
+                "guardrails": guardrails,
+                "problem_count": len(problems),
+            },
+        })
+
     # 3. Deliberation (3 sages → adopted_params via weighted median merge)
     deliberation_result = await deliberation_client.deliberate(
         analysis=analysis,
@@ -239,6 +266,28 @@ async def run_full(
 
     # Extract DSP params from deliberation result (weighted median output)
     dsp_params = deliberation_result.get("adopted_params", {})
+
+    # Emit deliberation stage with adopted params
+    if on_stage:
+        await on_stage("deliberation_done", {
+            "intermediate": {
+                "track_identity": track_id,
+                "metrics": {
+                    "integrated_lufs": metrics.get("integrated_lufs"),
+                    "true_peak_dbtp": metrics.get("true_peak_dbtp"),
+                    "crest_db": metrics.get("crest_db"),
+                    "low_mono_correlation": metrics.get("low_mono_correlation_below_120hz"),
+                    "stereo_width_mean": metrics.get("stereo_width_mean"),
+                    "harshness_risk": metrics.get("harshness_risk"),
+                    "mud_risk": metrics.get("mud_risk"),
+                },
+                "guardrails": guardrails,
+                "problem_count": len(problems),
+                "adopted_params": dsp_params,
+                "target_lufs": deliberation_result.get("target_lufs"),
+                "target_true_peak": deliberation_result.get("target_true_peak"),
+            },
+        })
 
     # Apply RENDITION_DSP config overrides
     if dsp_config:
